@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
+from calibration import bridge_calibration_state
 from db import connect, now_iso, write_audit
 from models import LaneIn
 
@@ -16,18 +17,27 @@ def list_lanes(authorization: AuthHeader = None, bridge_id: int | None = None):
     with connect() as conn:
         if bridge_id:
             rows = conn.execute(
-                """SELECT l.*, b.bridge_code, b.name bridge_name FROM weigh_lanes l
+                """SELECT l.*, b.bridge_code, b.name bridge_name,
+                          b.calibration_date, b.calibration_valid_until
+                   FROM weigh_lanes l
                    JOIN weigh_bridges b ON b.id=l.bridge_id
                    WHERE l.bridge_id=? ORDER BY l.lane_code""",
                 (bridge_id,),
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT l.*, b.bridge_code, b.name bridge_name FROM weigh_lanes l
+                """SELECT l.*, b.bridge_code, b.name bridge_name,
+                          b.calibration_date, b.calibration_valid_until
+                   FROM weigh_lanes l
                    JOIN weigh_bridges b ON b.id=l.bridge_id
                    ORDER BY l.lane_code"""
             ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+        items = []
+        for r in rows:
+            d = dict(r)
+            d.update(bridge_calibration_state(d))
+            items.append(d)
+        return {"items": items}
 
 
 @router.get("/api/lanes/{lane_id}")
@@ -35,7 +45,8 @@ def get_lane(lane_id: int, authorization: AuthHeader = None):
     require_user(authorization)
     with connect() as conn:
         row = conn.execute(
-            """SELECT l.*, b.bridge_code, b.max_gross_t, b.axle_limit
+            """SELECT l.*, b.bridge_code, b.max_gross_t, b.axle_limit,
+                      b.calibration_date, b.calibration_valid_until
                FROM weigh_lanes l JOIN weigh_bridges b ON b.id=l.bridge_id
                WHERE l.id=?""",
             (lane_id,),
@@ -47,7 +58,9 @@ def get_lane(lane_id: int, authorization: AuthHeader = None):
                WHERE lane_id=? ORDER BY id DESC LIMIT 8""",
             (lane_id,),
         ).fetchall()
-        return {"lane": dict(row), "recent_tickets": [dict(t) for t in tickets]}
+        lane = dict(row)
+        lane.update(bridge_calibration_state(lane))
+        return {"lane": lane, "recent_tickets": [dict(t) for t in tickets]}
 
 
 @router.post("/api/lanes")

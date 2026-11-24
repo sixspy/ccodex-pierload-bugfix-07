@@ -15,7 +15,7 @@ class LockIn(BaseModel):
     action: str = "acquire"
 
 
-def try_acquire(conn, lock_key: str, holder: str) -> bool:
+def try_acquire(conn, lock_key: str, holder: str, actor: str | None = None) -> bool:
     now = now_iso()
     row = conn.execute(
         "SELECT holder FROM pier_locks WHERE lock_key=?", (lock_key,)
@@ -31,7 +31,7 @@ def try_acquire(conn, lock_key: str, holder: str) -> bool:
     conn.execute(
         """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
            VALUES (?,?,?,?,?)""",
-        (lock_key, holder, "争用", f"持有者={row['holder']}", now),
+        (lock_key, actor or holder, "争用", f"持有者={row['holder']}", now),
     )
     return False
 
@@ -43,8 +43,12 @@ def release(conn, lock_key: str, holder: str) -> None:
     )
 
 
-def require_lock(conn, lock_key: str, holder: str) -> None:
-    if not try_acquire(conn, lock_key, holder):
+def require_lock(
+    conn, lock_key: str, holder: str, actor: str | None = None
+) -> None:
+    if not try_acquire(conn, lock_key, holder, actor=actor):
+        # 争用痕必须先落地，否则外层回滚会吞掉记录
+        conn.commit()
         raise HTTPException(409, "争用：后到只记争用，不写业务")
 
 

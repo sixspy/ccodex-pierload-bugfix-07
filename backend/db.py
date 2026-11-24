@@ -51,6 +51,42 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def today_iso() -> str:
+    from datetime import date
+
+    return date.today().isoformat()
+
+
+def plus_days_iso(base: str, days: int) -> str:
+    from datetime import date, timedelta
+
+    start = date.fromisoformat(base[:10])
+    return (start + timedelta(days=days)).isoformat()
+
+
+def _migrate_bridge_calibration(conn: sqlite3.Connection) -> None:
+    """老库补列并回填校准有效期，保证单一数据源可读。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(weigh_bridges)")}
+    if "calibration_date" not in cols:
+        conn.execute("ALTER TABLE weigh_bridges ADD COLUMN calibration_date TEXT")
+    if "calibration_valid_until" not in cols:
+        conn.execute(
+            "ALTER TABLE weigh_bridges ADD COLUMN calibration_valid_until TEXT"
+        )
+    rows = conn.execute(
+        """SELECT id, created_at, calibration_date, calibration_valid_until
+           FROM weigh_bridges WHERE calibration_valid_until IS NULL
+              OR calibration_valid_until=''"""
+    ).fetchall()
+    for row in rows:
+        base = (row["created_at"] or now_iso())[:10]
+        conn.execute(
+            """UPDATE weigh_bridges SET calibration_date=?, calibration_valid_until=?
+               WHERE id=?""",
+            (base, plus_days_iso(base, 365), row["id"]),
+        )
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   username TEXT PRIMARY KEY,
@@ -65,6 +101,8 @@ CREATE TABLE IF NOT EXISTS weigh_bridges(
   max_gross_t REAL NOT NULL,
   axle_limit INTEGER NOT NULL DEFAULT 6,
   status TEXT NOT NULL,
+  calibration_date TEXT,
+  calibration_valid_until TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS weigh_lanes(
@@ -231,7 +269,8 @@ def seed_bridges(conn: sqlite3.Connection) -> None:
             continue
         conn.execute(
             """INSERT INTO weigh_bridges(bridge_code,pier_zone,name,max_gross_t,
-               axle_limit,status,created_at) VALUES (?,?,?,?,?,?,?)""",
+               axle_limit,status,calibration_date,calibration_valid_until,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (
                 row["bridge_code"],
                 row["pier_zone"],
@@ -239,6 +278,12 @@ def seed_bridges(conn: sqlite3.Connection) -> None:
                 float(row["max_gross_t"]),
                 int(row.get("axle_limit", 6)),
                 row.get("status", "运行"),
+                row.get("calibration_date")
+                or (row.get("created_at", now_iso()))[:10],
+                row.get("calibration_valid_until")
+                or plus_days_iso(
+                    (row.get("created_at", now_iso()))[:10], 365
+                ),
                 row.get("created_at", now_iso()),
             ),
         )
@@ -439,6 +484,7 @@ def seed_lineage_samples(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate_bridge_calibration(conn)
         seed_users(conn)
         seed_bridges(conn)
         seed_lanes(conn)
@@ -477,8 +523,33 @@ def dashboard_stats(conn: sqlite3.Connection) -> dict:
         """SELECT COUNT(*) c FROM weigh_tickets
            WHERE status='旁路挂起'"""
     ).fetchone()["c"]
+    expired_calibration = conn.execute(
+        """SELECT COUNT(*) c FROM weigh_bridges
+           WHERE calibration_valid_until IS NOT NULL
+             AND calibration_valid_until != ''
+             AND calibration_valid_until < ?""",
+        (today_iso(),),
+    ).fetchone()["c"]
+    calibration_alerts = [
+        {
+            "bridge_code": r["bridge_code"],
+            "name": r["name"],
+            "calibration_valid_until": r["calibration_valid_until"],
+        }
+        for r in conn.execute(
+            """SELECT bridge_code, name, calibration_valid_until
+               FROM weigh_bridges
+               WHERE calibration_valid_until IS NOT NULL
+                 AND calibration_valid_until != ''
+                 AND calibration_valid_until < ?
+               ORDER BY bridge_code""",
+            (today_iso(),),
+        ).fetchall()
+    ]
     return {
         "bridges": bridges,
+        "expired_calibration_bridges": expired_calibration,
+        "calibration_alerts": calibration_alerts,
         "lanes": lanes,
         "tickets": tickets,
         "open_overloads": open_holds,

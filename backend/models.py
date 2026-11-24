@@ -11,6 +11,8 @@ class BridgeIn(BaseModel):
     max_gross_t: float = Field(gt=0, lt=200)
     axle_limit: int = Field(ge=2, le=12)
     status: str = "运行"
+    calibration_date: str | None = None
+    calibration_valid_until: str | None = None
 
 
 class LaneIn(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
+from calibration import ticket_calibration_state
 from validators import validate_bl_match
 
 router = APIRouter(tags=["reconcile"])
@@ -43,8 +44,12 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
         "SELECT * FROM bl_manifests WHERE bl_code=?", (bl_code,)
     ).fetchone()
     tickets = conn.execute(
-        """SELECT ticket_code, gross_t, status, generation FROM weigh_tickets
-           WHERE bl_ref=? AND status NOT IN ('作废')""",
+        """SELECT t.ticket_code, t.gross_t, t.status, t.generation, t.created_at,
+                  b.bridge_code, b.calibration_date, b.calibration_valid_until
+           FROM weigh_tickets t
+           JOIN weigh_lanes l ON l.id=t.lane_id
+           JOIN weigh_bridges b ON b.id=l.bridge_id
+           WHERE t.bl_ref=? AND t.status NOT IN ('作废')""",
         (bl_code,),
     ).fetchall()
     if not tickets:
@@ -55,8 +60,17 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
             "balanced": False,
             "reason": "无过磅票",
             "tickets": [],
+            "unqualified_tickets": [],
         }
-    ticket_sum = round(sum(float(t["gross_t"]) for t in tickets), 3)
+    qualified = []
+    unqualified = []
+    for t in tickets:
+        ok, why = ticket_calibration_state(t)
+        row = dict(t)
+        row["calibration_ok"] = ok
+        row["calibration_note"] = why
+        (qualified if ok else unqualified).append(row)
+    ticket_sum = round(sum(float(t["gross_t"]) for t in qualified), 3)
     declared = float(bl["declared_gross_t"])
     matched = validate_bl_match(declared, ticket_sum, tolerance=0.1)
     seal_rows = conn.execute(
@@ -73,7 +87,8 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
         "balanced": matched,
         "proof_ready": proof_ok,
         "seal_count": len(seal_rows),
-        "tickets": [dict(t) for t in tickets],
+        "tickets": qualified,
+        "unqualified_tickets": unqualified,
         "seals": [dict(s) for s in seal_rows],
     }
 

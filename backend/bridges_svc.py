@@ -4,7 +4,8 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
-from db import connect, now_iso, write_audit
+from calibration import bridge_calibration_state
+from db import connect, now_iso, plus_days_iso, write_audit
 from models import BridgeIn
 
 router = APIRouter(tags=["bridges"])
@@ -17,7 +18,12 @@ def list_bridges(authorization: AuthHeader = None):
         rows = conn.execute(
             "SELECT * FROM weigh_bridges ORDER BY id"
         ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+        items = []
+        for r in rows:
+            d = dict(r)
+            d.update(bridge_calibration_state(d))
+            items.append(d)
+        return {"items": items}
 
 
 @router.get("/api/bridges/{bridge_id}")
@@ -39,14 +45,14 @@ def get_bridge(bridge_id: int, authorization: AuthHeader = None):
                WHERE l.bridge_id=? AND t.status NOT IN ('作废','已封闸')""",
             (bridge_id,),
         ).fetchone()
-        # BUGFIX-07 埋雷：详情恒报校准有效
         data = dict(row)
-        data["calibration_ok"] = True
+        data.update(bridge_calibration_state(data))
         return {
             "bridge": data,
             "lanes": [dict(x) for x in lanes],
             "active_tickets": stats["active"],
-            "calibration_ok": True,
+            "calibration_ok": data["calibration_ok"],
+            "calibration_state": data["calibration_state"],
         }
 
 
@@ -59,9 +65,14 @@ def create_bridge(body: BridgeIn, authorization: AuthHeader = None):
         ).fetchone():
             raise HTTPException(409, "地磅编码已存在")
         now = now_iso()
+        calibration_date = body.calibration_date or now[:10]
+        valid_until = body.calibration_valid_until or plus_days_iso(
+            calibration_date, 365
+        )
         cur = conn.execute(
             """INSERT INTO weigh_bridges(bridge_code,pier_zone,name,max_gross_t,
-               axle_limit,status,created_at) VALUES (?,?,?,?,?,?,?)""",
+               axle_limit,status,calibration_date,calibration_valid_until,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (
                 body.bridge_code,
                 body.pier_zone,
@@ -69,6 +80,8 @@ def create_bridge(body: BridgeIn, authorization: AuthHeader = None):
                 body.max_gross_t,
                 body.axle_limit,
                 body.status,
+                calibration_date,
+                valid_until,
                 now,
             ),
         )

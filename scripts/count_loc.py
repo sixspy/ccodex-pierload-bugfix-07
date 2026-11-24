@@ -5,6 +5,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SKIP_PARTS = {
+    ".venv",
+    "venv",
     "node_modules",
     "__pycache__",
     ".pytest_cache",

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from calibration import bridge_calibration_state, ensure_bridge_calibrated
 from locks import release, require_lock
 from models import TicketIn
 from validators import (
@@ -35,7 +37,9 @@ def _next_ticket_code(conn, lane_id: int) -> str:
 def list_tickets(authorization: AuthHeader = None, status: str | None = None):
     require_user(authorization)
     with connect() as conn:
-        q = """SELECT t.*, l.lane_code, b.bridge_code FROM weigh_tickets t
+        q = """SELECT t.*, l.lane_code, b.bridge_code,
+                      b.calibration_date, b.calibration_valid_until
+               FROM weigh_tickets t
                JOIN weigh_lanes l ON l.id=t.lane_id
                JOIN weigh_bridges b ON b.id=l.bridge_id"""
         if status:
@@ -48,6 +52,7 @@ def list_tickets(authorization: AuthHeader = None, status: str | None = None):
         for r in rows:
             d = dict(r)
             d["axle_weights"] = json.loads(d["axle_weights"] or "[]")
+            d.update(bridge_calibration_state(d))
             items.append(d)
         return {"items": items}
 
@@ -57,7 +62,8 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
     require_user(authorization)
     with connect() as conn:
         row = conn.execute(
-            """SELECT t.*, l.lane_code, l.overload_threshold_t, b.name bridge_name
+            """SELECT t.*, l.lane_code, l.overload_threshold_t, b.name bridge_name,
+                      b.calibration_date, b.calibration_valid_until
                FROM weigh_tickets t
                JOIN weigh_lanes l ON l.id=t.lane_id
                JOIN weigh_bridges b ON b.id=l.bridge_id
@@ -68,6 +74,7 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
             raise HTTPException(404, "过磅票不存在")
         data = dict(row)
         data["axle_weights"] = json.loads(data["axle_weights"] or "[]")
+        data.update(bridge_calibration_state(data))
         holds = conn.execute(
             "SELECT * FROM overload_holds WHERE ticket_id=? ORDER BY id DESC",
             (ticket_id,),
@@ -91,19 +98,40 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
 @router.post("/api/tickets")
 def create_ticket(body: TicketIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
-    lock_key = f"lane:{body.lane_id}"
+    # 每次建票请求独立租约：同账号两路会话也不得共用持锁人
+    holder = f"{user}#{uuid.uuid4().hex[:12]}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        lane_row = conn.execute(
+            "SELECT bridge_id FROM weigh_lanes WHERE id=?", (body.lane_id,)
+        ).fetchone()
+        if not lane_row:
+            raise HTTPException(404, "车道不存在")
+        # 同磅并发建票必须先占地磅锁；后到只记争用痕，不写业务
+        bridge_lock = f"bridge:{lane_row['bridge_id']}"
+        require_lock(conn, bridge_lock, holder, actor=user)
+        conn.commit()
+        lock_key = f"lane:{body.lane_id}"
+        try:
+            require_lock(conn, lock_key, holder, actor=user)
+            conn.commit()
+        except HTTPException:
+            # 车道锁未得：不得把地磅锁一并带走
+            release(conn, bridge_lock, holder)
+            conn.commit()
+            raise
         try:
             lane = conn.execute(
-                """SELECT l.*, b.max_gross_t, b.axle_limit, b.status bridge_status FROM weigh_lanes l
+                """SELECT l.*, b.max_gross_t, b.axle_limit, b.status bridge_status,
+                          b.calibration_date, b.calibration_valid_until
+                   FROM weigh_lanes l
                    JOIN weigh_bridges b ON b.id=l.bridge_id WHERE l.id=?""",
                 (body.lane_id,),
             ).fetchone()
             if not lane:
                 raise HTTPException(404, "车道不存在")
-            # BUGFIX-07 埋雷：地磅停用/过期仍入票，不读 bridge_status
             validate_lane_open(dict(lane))
+            # 校准过期即正式册零增拒写（乙路径影子待检不在本期范围）
+            ensure_bridge_calibrated(dict(lane))
             axles = [a.model_dump() for a in body.axle_weights]
             validate_axle_count(axles, int(lane["axle_limit"]))
             gross, _peak, _spread = validate_axle_weights(axles)
@@ -180,4 +208,8 @@ def create_ticket(body: TicketIn, authorization: AuthHeader = None):
                 "overload": is_over,
             }
         finally:
-            release(conn, lock_key, user)
+            # 先回滚中途业务残写，再释放两把锁并落地，避免锁泄漏
+            conn.rollback()
+            release(conn, lock_key, holder)
+            release(conn, bridge_lock, holder)
+            conn.commit()
